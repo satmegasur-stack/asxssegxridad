@@ -9,9 +9,9 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-        import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction, collection, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+        import { getFirestore, doc, getDoc, setDoc, deleteDoc, onSnapshot, runTransaction, collection, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
         import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail, signOut, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-        import { encryptData, decryptData, encryptFields, decryptFields } from "./cryptoUtils.js";
+        import { encryptData, decryptData, encryptFields, decryptFields, hashLookupKey } from "./cryptoUtils.js";
 
         /* Exponemos el módulo de cifrado en window para poder usarlo desde el
            <script> principal (que no es un módulo ES y no puede usar `import`).
@@ -22,6 +22,7 @@
         window._cryptoDecryptData = decryptData;
         window._cryptoEncryptFields = encryptFields;
         window._cryptoDecryptFields = decryptFields;
+        window._cryptoHashKey = hashLookupKey;
 
         const firebaseConfig = {
             apiKey: "AIzaSyDix66SN0R8X2m0dcuqw3cD9BOmENHgL4M",
@@ -64,38 +65,49 @@
            él mismo. */
         window._fbSendPasswordReset = (email) => sendPasswordResetEmail(auth, email);
 
-        window._fbGetDelegacion = async (phone) => {
-            if (!phone || phone === 'N/A') return null;
-            const key = phone.replace(/\D/g, '');
-            if (!key) return null;
+        /* ── DELEGACIONES ──
+           El ID del documento YA NO es el teléfono en claro: es un HMAC del
+           teléfono con la Clave Maestra (calculado en el script principal con
+           window._cryptoHashKey antes de llamar a estas funciones), y los
+           campos 'phone'/'delegacion' de dentro del documento van cifrados.
+           Estas funciones son solo I/O puro de Firestore: no conocen la Clave
+           Maestra ni hacen cifrado/descifrado, igual que el resto de
+           colecciones (transporte, incidencias, rma_tracking). */
+        window._fbGetDelegacionDoc = async (docId) => {
+            if (!docId) return null;
             try {
-                const snap = await getDoc(doc(db, 'delegaciones', key));
-                return snap.exists() ? snap.data().delegacion : null;
+                const snap = await getDoc(doc(db, 'delegaciones', docId));
+                return snap.exists() ? snap.data() : null;
             } catch (e) {
-                console.error('Firebase get error:', e);
+                console.error('Firebase get delegacion error:', e);
                 return null;
             }
         };
 
-        window._fbSetDelegacion = async (phone, delegacion) => {
-            if (!phone || phone === 'N/A') return;
-            const key = phone.replace(/\D/g, '');
-            if (!key) return;
+        window._fbSetDelegacionDoc = async (docId, data) => {
+            if (!docId) return;
             try {
-                await setDoc(doc(db, 'delegaciones', key), { delegacion, phone });
+                await setDoc(doc(db, 'delegaciones', docId), data);
             } catch (e) {
-                console.error('Firebase set error:', e);
+                console.error('Firebase set delegacion error:', e);
+                throw e;
             }
         };
 
-        window._fbGetAllDelegaciones = async () => {
+        window._fbDeleteDelegacionDoc = async (docId) => {
+            if (!docId) return;
+            try {
+                await deleteDoc(doc(db, 'delegaciones', docId));
+            } catch (e) {
+                console.error('Firebase delete delegacion error:', e);
+            }
+        };
+
+        window._fbGetAllDelegacionesRaw = async () => {
             try {
                 const snap = await getDocs(collection(db, 'delegaciones'));
                 const rows = [];
-                snap.forEach((d) => {
-                    const data = d.data() || {};
-                    rows.push({ phone: data.phone || d.id, delegacion: data.delegacion || null });
-                });
+                snap.forEach((d) => rows.push({ docId: d.id, data: d.data() || {} }));
                 return rows;
             } catch (e) {
                 console.error('Firebase get all delegaciones error:', e);
@@ -103,13 +115,12 @@
             }
         };
 
-        window._fbSetAllDelegaciones = async (rows) => {
+        window._fbSetAllDelegacionesRaw = async (entries) => {
             try {
                 const batch = writeBatch(db);
-                (rows || []).forEach((r) => {
-                    const key = String(r.phone || '').replace(/\D/g, '');
-                    if (!key) return;
-                    batch.set(doc(db, 'delegaciones', key), { delegacion: r.delegacion, phone: r.phone });
+                (entries || []).forEach((e) => {
+                    if (!e || !e.docId) return;
+                    batch.set(doc(db, 'delegaciones', e.docId), e.data);
                 });
                 await batch.commit();
             } catch (e) {
@@ -2050,6 +2061,161 @@ document.addEventListener('DOMContentLoaded', () => {
         return e;
     }
 
+    /* ── Historial de incidencias: usa exactamente el mismo cifrado por
+       campos que la colección "incidencias" (misma forma de objeto), para
+       que el texto de la incidencia y de sus actualizaciones nunca se
+       guarden en claro al archivarse. */
+    const encryptIncidenciaHistEntry = encryptIncidenciaEntry;
+    const decryptIncidenciaHistEntry = decryptIncidenciaEntry;
+
+    /* ── Historial de RMA: ciframos el número de RMA, el usuario (email) y
+       la garantía; dejamos en claro id/fase/fecha, usados para orden y
+       lógica interna. */
+    const RMA_HIST_FIELDS = ['rma', 'usuario', 'garantia'];
+    async function encryptRmaHistEntry(entry) {
+        return window._cryptoEncryptFields(entry, RMA_HIST_FIELDS, masterKey);
+    }
+    async function decryptRmaHistEntry(entry) {
+        return window._cryptoDecryptFields(entry, RMA_HIST_FIELDS, masterKey);
+    }
+
+    /* ── Contabilidad RMA: los precios y los totales del histórico son datos
+       económicos, así que también se cifran. Como son números, hay que
+       convertirlos a texto para cifrarlos y volver a number al descifrar. */
+    async function encryptNumberField(value) {
+        if (value === null || value === undefined || value === '') return value;
+        return window._cryptoEncryptData(String(value), masterKey);
+    }
+    async function decryptNumberField(value, fallback) {
+        if (value === null || value === undefined || value === '') return value;
+        try {
+            const txt = await window._cryptoDecryptData(value, masterKey);
+            const n = parseFloat(txt);
+            return Number.isNaN(n) ? fallback : n;
+        } catch (err) {
+            console.warn('No se pudo descifrar un valor numérico de contabilidad', err);
+            return fallback;
+        }
+    }
+    async function encryptRmaContabilidadDoc(data) {
+        const out = { ...data };
+        out.precioGarantia = await encryptNumberField(data.precioGarantia);
+        out.precioFueraGarantia = await encryptNumberField(data.precioFueraGarantia);
+        out.historico = await Promise.all((data.historico || []).map(async (h) => ({
+            ...h,
+            unidades: await encryptNumberField(h.unidades),
+            precioTotal: await encryptNumberField(h.precioTotal)
+        })));
+        return out;
+    }
+    async function decryptRmaContabilidadDoc(data) {
+        if (!data) return data;
+        const out = { ...data };
+        out.precioGarantia = await decryptNumberField(data.precioGarantia, null);
+        out.precioFueraGarantia = await decryptNumberField(data.precioFueraGarantia, null);
+        out.historico = await Promise.all((data.historico || []).map(async (h) => ({
+            ...h,
+            unidades: await decryptNumberField(h.unidades, 0),
+            precioTotal: await decryptNumberField(h.precioTotal, 0)
+        })));
+        return out;
+    }
+
+    /* ── Roles de usuario: se cifra el email (dato personal); el rol
+       ("admin"/"tecnico") se deja en claro porque es un campo técnico usado
+       constantemente para control de acceso. */
+    const USER_ROLE_FIELDS = ['email'];
+    async function encryptUserRoleEntry(entry) {
+        return window._cryptoEncryptFields(entry, USER_ROLE_FIELDS, masterKey);
+    }
+    async function decryptUserRoleEntry(entry) {
+        return window._cryptoDecryptFields(entry, USER_ROLE_FIELDS, masterKey);
+    }
+
+    /* ── Delegaciones ──
+       El teléfono ya no es (ni aparece dentro de) un dato legible en
+       Firestore: el ID del documento es un HMAC del teléfono con la Clave
+       Maestra (irreversible sin ella), y los campos 'phone' y 'delegacion'
+       de dentro del documento van cifrados con AES-GCM. */
+    const DELEGACION_FIELDS = ['phone', 'delegacion'];
+
+    function delegacionPhoneKey(phone) {
+        return String(phone || '').replace(/\D/g, '');
+    }
+
+    async function delegacionDocId(phone) {
+        const key = delegacionPhoneKey(phone);
+        if (!key || !masterKey) return null;
+        return window._cryptoHashKey(key, masterKey);
+    }
+
+    /* Los IDs nuevos son siempre 64 caracteres hexadecimales (salida de
+       HMAC-SHA256). Los documentos "antiguos" (de antes de este cambio)
+       tienen como ID el teléfono en claro, así que nunca coinciden con este
+       patrón: sirve para distinguir unos de otros durante la migración. */
+    function esIdDelegacionYaMigrado(docId) {
+        return typeof docId === 'string' && /^[0-9a-f]{64}$/.test(docId);
+    }
+
+    async function getDelegacionForPhone(phone) {
+        if (!masterKey) return null;
+        const docId = await delegacionDocId(phone);
+        if (!docId) return null;
+        const raw = await window._fbGetDelegacionDoc(docId);
+        if (!raw) return null;
+        const claro = await window._cryptoDecryptFields(raw, DELEGACION_FIELDS, masterKey);
+        return claro.delegacion || null;
+    }
+
+    async function setDelegacionForPhone(phone, delegacion) {
+        if (!masterKey) return;
+        const key = delegacionPhoneKey(phone);
+        if (!key) return;
+        const docId = await delegacionDocId(key);
+        const cifrado = await window._cryptoEncryptFields({ phone: key, delegacion }, DELEGACION_FIELDS, masterKey);
+        await window._fbSetDelegacionDoc(docId, cifrado);
+    }
+
+    async function getAllDelegacionesRawEncrypted() {
+        const rows = await window._fbGetAllDelegacionesRaw();
+        return rows.filter(r => esIdDelegacionYaMigrado(r.docId));
+    }
+
+    /* Migración única (por sesión): mueve los documentos "antiguos" de
+       delegaciones —ID = teléfono en claro, datos sin cifrar— al nuevo
+       esquema —ID = hash del teléfono, datos cifrados—, y borra los
+       antiguos. Se ejecuta automáticamente tras el login, en cuanto la
+       Clave Maestra está disponible. Es idempotente: si ya no quedan
+       documentos "antiguos", no hace nada. */
+    let delegacionesMigrationDone = false;
+    async function migrateDelegacionesLegacyIfNeeded() {
+        if (delegacionesMigrationDone || !masterKey) return;
+        delegacionesMigrationDone = true;
+        try {
+            const rows = await window._fbGetAllDelegacionesRaw();
+            const legacy = rows.filter(r => !esIdDelegacionYaMigrado(r.docId));
+            if (legacy.length === 0) return;
+
+            const nuevasEntradas = [];
+            for (const r of legacy) {
+                const key = delegacionPhoneKey(r.data.phone || r.docId);
+                if (!key) continue;
+                const docId = await delegacionDocId(key);
+                const cifrado = await window._cryptoEncryptFields(
+                    { phone: key, delegacion: r.data.delegacion ?? null },
+                    DELEGACION_FIELDS, masterKey
+                );
+                nuevasEntradas.push({ docId, data: cifrado });
+            }
+            if (nuevasEntradas.length) await window._fbSetAllDelegacionesRaw(nuevasEntradas);
+            for (const r of legacy) await window._fbDeleteDelegacionDoc(r.docId);
+            console.log(`Delegaciones: migradas ${nuevasEntradas.length} entrada(s) antigua(s) al nuevo esquema cifrado.`);
+        } catch (err) {
+            console.error('Error migrando delegaciones al nuevo esquema cifrado:', err);
+            delegacionesMigrationDone = false; // reintentar en el siguiente login si algo falló
+        }
+    }
+
     /* ── DOM refs ── */
     const fileInput          = document.getElementById('file-input');
     const delegacionesButton = document.getElementById('delegaciones-button');
@@ -2564,12 +2730,15 @@ document.addEventListener('DOMContentLoaded', () => {
     ════════════════════════════════════════ */
 
     async function saveIncidenciasHistorial() {
-        if (window._fbSetIncidenciasHistorial) await window._fbSetIncidenciasHistorial(incidenciasHistorial);
+        if (!window._fbSetIncidenciasHistorial || !masterKey) return;
+        const cifradas = await Promise.all(incidenciasHistorial.map(encryptIncidenciaHistEntry));
+        await window._fbSetIncidenciasHistorial(cifradas);
     }
 
     async function loadIncidenciasHistorial() {
+        if (!masterKey) return;
         const raw = window._fbGetIncidenciasHistorial ? await window._fbGetIncidenciasHistorial() : [];
-        incidenciasHistorial = raw;
+        incidenciasHistorial = await Promise.all(raw.map(decryptIncidenciaHistEntry));
     }
 
     function renderIncidenciasHistorial() {
@@ -3191,7 +3360,7 @@ document.addEventListener('DOMContentLoaded', () => {
         saveDelegacionBtn.disabled = true;
         saveDelegacionBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
         try {
-            await window._fbSetDelegacion(phone, valor);
+            await setDelegacionForPhone(phone, valor);
             delegacionInput.classList.add('saved');
             delegacionStatus.classList.add('show');
             setTimeout(() => delegacionStatus.classList.remove('show'), 2500);
@@ -3398,14 +3567,14 @@ document.addEventListener('DOMContentLoaded', () => {
         const phone = entry['Phone'] || '';
 
         const loadDelegacion = () => {
-            window._fbGetDelegacion(String(phone)).then(val => {
+            getDelegacionForPhone(String(phone)).then(val => {
                 delegacionInput.placeholder = 'Escribe la delegación...';
                 saveDelegacionBtn.disabled  = false;
                 if (val) { delegacionInput.value = val; delegacionInput.classList.add('saved'); }
             });
         };
 
-        if (window._fbGetDelegacion) {
+        if (masterKey) {
             loadDelegacion();
         } else {
             delegacionInput.placeholder = 'Esperando Firebase...';
@@ -3542,11 +3711,15 @@ document.addEventListener('DOMContentLoaded', () => {
     rmaApplyPhaseFilter();
 
     async function saveRmaHistorial() {
-        if (window._fbSetRmaHistorial) await window._fbSetRmaHistorial(rmaHistorial);
+        if (!window._fbSetRmaHistorial || !masterKey) return;
+        const cifrado = await Promise.all(rmaHistorial.map(encryptRmaHistEntry));
+        await window._fbSetRmaHistorial(cifrado);
     }
 
     async function loadRmaHistorial() {
-        rmaHistorial = window._fbGetRmaHistorial ? await window._fbGetRmaHistorial() : [];
+        if (!masterKey) { rmaHistorial = []; return; }
+        const raw = window._fbGetRmaHistorial ? await window._fbGetRmaHistorial() : [];
+        rmaHistorial = await Promise.all(raw.map(decryptRmaHistEntry));
         renderDashboard();
     }
 
@@ -4671,7 +4844,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let rmaContabilidad = { precioGarantia: null, precioFueraGarantia: null, historico: [], beneficioClearedAt: null };
 
     async function loadRmaContabilidad() {
-        const data = window._fbGetRmaContabilidad ? await window._fbGetRmaContabilidad() : null;
+        if (!masterKey) return;
+        const raw = window._fbGetRmaContabilidad ? await window._fbGetRmaContabilidad() : null;
+        const data = raw ? await decryptRmaContabilidadDoc(raw) : null;
         if (data) {
             rmaContabilidad.precioGarantia = (typeof data.precioGarantia === 'number') ? data.precioGarantia : null;
             rmaContabilidad.precioFueraGarantia = (typeof data.precioFueraGarantia === 'number') ? data.precioFueraGarantia : null;
@@ -4679,6 +4854,16 @@ document.addEventListener('DOMContentLoaded', () => {
             rmaContabilidad.beneficioClearedAt = (typeof data.beneficioClearedAt === 'string') ? data.beneficioClearedAt : null;
         }
         renderDashBeneficioChart();
+    }
+
+    /* Cifra y guarda el objeto de contabilidad RMA completo. Todas las
+       operaciones que modifican rmaContabilidad deben pasar por aquí (nunca
+       llamar a window._fbSetRmaContabilidad directamente) para que los
+       importes nunca lleguen a Firebase sin cifrar. */
+    async function saveRmaContabilidad() {
+        if (!window._fbSetRmaContabilidad || !masterKey) return;
+        const cifrado = await encryptRmaContabilidadDoc(rmaContabilidad);
+        await window._fbSetRmaContabilidad(cifrado);
     }
 
     function fillRmaAccountingForm() {
@@ -4840,7 +5025,7 @@ document.addEventListener('DOMContentLoaded', () => {
             rmaContabilidad.historico.push({ id: genId('rmahist-mes'), mes, anio, unidades, precioTotal });
         }
 
-        if (window._fbSetRmaContabilidad) await window._fbSetRmaContabilidad(rmaContabilidad);
+        await saveRmaContabilidad();
         rmaAccountingHistUnidades.value = '';
         rmaAccountingHistPrecioTotal.value = '';
         renderRmaAccountingHistorico();
@@ -4851,7 +5036,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.rmaAccountingHistRemove = async function(id) {
         if (!confirm('¿Eliminar este mes de la lista?')) return;
         rmaContabilidad.historico = (rmaContabilidad.historico || []).filter(h => h.id !== id);
-        if (window._fbSetRmaContabilidad) await window._fbSetRmaContabilidad(rmaContabilidad);
+        await saveRmaContabilidad();
         renderRmaAccountingHistorico();
         renderDashBeneficioChart();
     };
@@ -4883,7 +5068,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const precioGarantia = rmaAccountingPriceGInput.value === '' ? null : Math.max(0, parseFloat(rmaAccountingPriceGInput.value));
         const precioFueraGarantia = rmaAccountingPriceFInput.value === '' ? null : Math.max(0, parseFloat(rmaAccountingPriceFInput.value));
         rmaContabilidad = { precioGarantia, precioFueraGarantia, historico: rmaContabilidad.historico || [], beneficioClearedAt: rmaContabilidad.beneficioClearedAt || null };
-        if (window._fbSetRmaContabilidad) await window._fbSetRmaContabilidad(rmaContabilidad);
+        await saveRmaContabilidad();
         rmaAccountingSavedMsg.classList.add('show');
         setTimeout(() => rmaAccountingSavedMsg.classList.remove('show'), 2000);
         renderRmaAccountingBeneficio();
@@ -4901,7 +5086,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function rmaBeneficioClearAll() {
         if (!confirm('¿Borrar de "Beneficio de RMAs finalizados" todos los RMAs finalizados hasta este momento?\n\nNo se eliminan del historial general de movimientos, pero dejarán de contarse aquí (inclúyelos a mano en "Meses anteriores" si corresponde). Los RMAs que se finalicen a partir de ahora sí se seguirán contando automáticamente.\n\nEsta acción no se puede deshacer.')) return;
         rmaContabilidad.beneficioClearedAt = new Date().toISOString();
-        if (window._fbSetRmaContabilidad) await window._fbSetRmaContabilidad(rmaContabilidad);
+        await saveRmaContabilidad();
         renderRmaAccountingBeneficio();
         renderRmaAccountingHistorico();
         renderDashBeneficioChart();
@@ -4937,7 +5122,9 @@ document.addEventListener('DOMContentLoaded', () => {
     ════════════════════════════════════════ */
 
     async function loadUserRoles() {
-        userRoles = window._fbGetUserRoles ? await window._fbGetUserRoles() : [];
+        if (!masterKey) { userRoles = []; return; }
+        const raw = window._fbGetUserRoles ? await window._fbGetUserRoles() : [];
+        userRoles = await Promise.all(raw.map(decryptUserRoleEntry));
         // RGPD / seguridad: purga de emergencia. Versiones anteriores de esta app
         // guardaban la contraseña de cada usuario en texto plano en Firestore.
         // Si detectamos algún registro con ese campo heredado, lo eliminamos y
@@ -4952,7 +5139,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function saveUserRoles() {
-        if (window._fbSetUserRoles) await window._fbSetUserRoles(userRoles);
+        if (!window._fbSetUserRoles || !masterKey) return;
+        const cifrado = await Promise.all(userRoles.map(encryptUserRoleEntry));
+        await window._fbSetUserRoles(cifrado);
     }
 
     function getRoleForEmail(email) {
@@ -5117,8 +5306,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 window._fbGetRmaHistorial ? window._fbGetRmaHistorial() : Promise.resolve([]),
                 window._fbGetRmaContabilidad ? window._fbGetRmaContabilidad() : Promise.resolve(null),
                 window._fbGetUserRoles ? window._fbGetUserRoles() : Promise.resolve([]),
-                window._fbGetAllDelegaciones ? window._fbGetAllDelegaciones() : Promise.resolve([])
+                getAllDelegacionesRawEncrypted()
             ]);
+            const delegacionesFlat = delegacionesData.map(r => ({ docId: r.docId, ...r.data }));
 
             const wb = XLSX.utils.book_new();
             XLSX.utils.book_append_sheet(wb, backupSheetFromArray(transporte), 'transporte');
@@ -5128,7 +5318,7 @@ document.addEventListener('DOMContentLoaded', () => {
             XLSX.utils.book_append_sheet(wb, backupSheetFromArray(rmaHistorialData), 'rma_historial');
             XLSX.utils.book_append_sheet(wb, backupSheetFromObject(rmaContabilidadData), 'rma_contabilidad');
             XLSX.utils.book_append_sheet(wb, backupSheetFromArray(userRolesData), 'usuarios');
-            XLSX.utils.book_append_sheet(wb, backupSheetFromArray(delegacionesData), 'delegaciones');
+            XLSX.utils.book_append_sheet(wb, backupSheetFromArray(delegacionesFlat), 'delegaciones');
             XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{
                 aplicacion: 'Gestión de Recogidas y Equipos',
                 fecha_exportacion: new Date().toISOString(),
@@ -5199,7 +5389,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (rmaHistorialData !== null && window._fbSetRmaHistorial) tasks.push(window._fbSetRmaHistorial(rmaHistorialData));
             if (rmaContabilidadData !== null && window._fbSetRmaContabilidad) tasks.push(window._fbSetRmaContabilidad(rmaContabilidadData));
             if (userRolesData !== null && window._fbSetUserRoles) tasks.push(window._fbSetUserRoles(userRolesData));
-            if (delegacionesData !== null && window._fbSetAllDelegaciones) tasks.push(window._fbSetAllDelegaciones(delegacionesData));
+            if (delegacionesData !== null && window._fbSetAllDelegacionesRaw) {
+                const entradas = delegacionesData
+                    .filter(r => r && r.docId)
+                    .map(r => ({ docId: r.docId, data: { phone: r.phone, delegacion: r.delegacion } }));
+                if (entradas.length) tasks.push(window._fbSetAllDelegacionesRaw(entradas));
+            }
 
             await Promise.all(tasks);
             setBackupStatus('Datos restaurados correctamente. Recargando la aplicación...', 'success');
@@ -5240,6 +5435,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (user) {
             currentUserEmail = user.email || '';
             await ensureMasterKey();
+            migrateDelegacionesLegacyIfNeeded();
             startEncryptedDataListeners();
             await loadUserRoles();
             isAdmin = getRoleForEmail(currentUserEmail) === 'admin';

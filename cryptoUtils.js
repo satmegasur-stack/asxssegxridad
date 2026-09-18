@@ -180,4 +180,40 @@ async function decryptFields(obj, fields, secretKey) {
     return result;
 }
 
-export { encryptData, decryptData, encryptFields, decryptFields };
+/* ---------- Identificador determinista (para usar como ID de documento) ---------- */
+
+/**
+ * Genera un identificador determinista y NO reversible a partir de un texto
+ * (p.ej. un teléfono) y la Clave Maestra, usando HMAC-SHA256.
+ *
+ * A diferencia de encryptData(), esta función NO lleva salt aleatorio: el
+ * mismo texto + la misma Clave Maestra producen siempre el mismo resultado.
+ * Eso es justo lo que hace falta para usarlo como ID de documento en
+ * Firestore (para poder buscar por teléfono sin exponer el teléfono como ID).
+ *
+ * Sin la Clave Maestra, no es viable adivinar qué teléfono corresponde a un
+ * ID dado (es una función HMAC con clave secreta, no un hash público).
+ *
+ * IMPORTANTE: esto es de un solo sentido. No sirve para recuperar el texto
+ * original — para eso están encryptData/decryptData.
+ *
+ * @param {string} text - Texto a partir del cual generar el identificador (p.ej. un teléfono).
+ * @param {string} secretKey - Clave maestra del usuario.
+ * @returns {Promise<string>} Cadena hexadecimal de 64 caracteres, válida como ID de documento de Firestore.
+ */
+async function hashLookupKey(text, secretKey) {
+    if (!secretKey) throw new Error('hashLookupKey: falta la clave maestra (secretKey)');
+    const enc = new TextEncoder();
+    const hmacKey = await window.crypto.subtle.importKey(
+        'raw',
+        enc.encode(secretKey),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+    const sigBuffer = await window.crypto.subtle.sign('HMAC', hmacKey, enc.encode(String(text)));
+    const bytes = new Uint8Array(sigBuffer);
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export { encryptData, decryptData, encryptFields, decryptFields, hashLookupKey };
